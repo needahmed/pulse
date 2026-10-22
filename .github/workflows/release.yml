@@ -1,0 +1,99 @@
+name: Release
+
+# Push a tag like v1.0.0 and this builds a universal Pulse.app,
+# packages it as a DMG and publishes a GitHub Release with it attached.
+#
+# Signing and notarization are optional. Without the secrets below the
+# release is ad hoc signed and users get a Gatekeeper prompt on first launch.
+#
+#   MACOS_CERT_P12         base64 of your "Developer ID Application" .p12 export
+#   MACOS_CERT_PASSWORD    password you set when exporting the .p12
+#   APPLE_ID               Apple ID email of your developer account
+#   APPLE_TEAM_ID          10 character team ID
+#   APPLE_APP_PASSWORD     app specific password from account.apple.com
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    env:
+      HAS_CERT: ${{ secrets.MACOS_CERT_P12 != '' }}
+      HAS_NOTARY: ${{ secrets.APPLE_APP_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version from tag
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Import Developer ID certificate
+        if: env.HAS_CERT == 'true'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KC_PW="$(uuidgen)"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KC_PW" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KC_PW" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KC_PW" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | grep 'Developer ID Application' | head -1 | sed -E 's/.*"(.*)".*/\1/')"
+          echo "SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Build universal app
+        run: ./build.sh --universal
+
+      - name: Package DMG
+        run: scripts/make-dmg.sh "$VERSION"
+
+      - name: Notarize
+        if: env.HAS_CERT == 'true' && env.HAS_NOTARY == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool submit "dist/Pulse-$VERSION.dmg" \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" \
+            --wait
+          xcrun stapler staple "dist/Pulse-$VERSION.dmg"
+
+      - name: Checksum
+        run: |
+          cd dist
+          shasum -a 256 "Pulse-$VERSION.dmg" > "Pulse-$VERSION.dmg.sha256"
+          cat "Pulse-$VERSION.dmg.sha256"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## Install"
+            echo
+            echo "1. Download **Pulse-$VERSION.dmg** below and open it"
+            echo "2. Drag Pulse into Applications"
+            echo "3. Launch it. Pulse lives in the menu bar, there is no Dock icon or window"
+            if [ "$HAS_CERT" != "true" ] || [ "$HAS_NOTARY" != "true" ]; then
+              echo
+              echo "This build is not notarized by Apple, so macOS blocks the first launch."
+              echo "Open **System Settings > Privacy & Security**, scroll down and click **Open Anyway**,"
+              echo "or run \`xattr -dr com.apple.quarantine /Applications/Pulse.app\` once."
+            fi
+            echo
+            echo "Requires macOS 13 or later. Universal build for Apple Silicon and Intel."
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Pulse $VERSION" \
+            --notes-file notes.md \
+            --generate-notes
